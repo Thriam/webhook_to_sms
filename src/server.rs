@@ -1,60 +1,52 @@
-// src/server.rs
 use axum::{
-    routing::post,
-    extract::Json,
-    http::StatusCode,
+    extract::{Json, ws::{WebSocketUpgrade, Message}},
+    response::IntoResponse,
+    routing::{post, get},
     Router,
 };
 use serde::Deserialize;
 use std::net::SocketAddr;
-use tokio::sync::oneshot;
-use tracing::{info, error};
+use futures_util::StreamExt;
+use tokio_stream::wrappers::BroadcastStream;
 
-mod android;
+use crate::android;
 
 #[derive(Deserialize)]
 pub struct SmsRequest {
-    pub to: String,
-    pub message: String,
+    to: String,
+    message: String,
 }
 
-/// Start axum server listening on 0.0.0.0:port.
-/// Returns when the server stops or errors.
-pub async fn start_server(port: u16, shutdown_rx: oneshot::Receiver<()>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    tracing::info!("Starting axum server on port {}", port);
+async fn send_sms(Json(payload): Json<SmsRequest>) -> &'static str {
+    android::send_sms(&payload.to, &payload.message);
+    "SMS sent"
+}
 
-    // Build routes
-    let app = Router::new().route("/v1/sms", post(handle_send_sms));
+async fn sms_ws(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(|mut socket| async move {
+        let mut rx = android::subscribe_sms();
+        let mut stream = BroadcastStream::new(rx);
+
+        while let Some(Ok((from, body))) = stream.next().await {
+            let json = serde_json::json!({
+                "from": from,
+                "message": body
+            });
+            if socket.send(Message::Text(json.to_string())).await.is_err() {
+                break;
+            }
+        }
+    })
+}
+
+pub async fn start_server(port: u16, ws_path: String) {
+    let app = Router::new()
+        .route("/v1/sms", post(send_sms))
+        .route(&ws_path, get(sms_ws)); // <-- user defined path
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    let server = axum::Server::bind(&addr)
+    axum::Server::bind(&addr)
         .serve(app.into_make_service())
-        .with_graceful_shutdown(async {
-            // wait for shutdown signal
-            let _ = shutdown_rx.await;
-            tracing::info!("Shutdown signal received for axum server");
-        });
-
-    tracing::info!("Axum server listening on {}", addr);
-    if let Err(e) = server.await {
-        error!("Server error: {}", e);
-        return Err(Box::new(e));
-    }
-    Ok(())
-}
-
-async fn handle_send_sms(Json(payload): Json<SmsRequest>) -> Result<(StatusCode, String), (StatusCode, String)> {
-    tracing::info!("Received SMS request to={} msg_len={}", payload.to, payload.message.len());
-
-    // Call Android-side SMS send via JNI bridge
-    match android::send_sms(&payload.to, &payload.message) {
-        Ok(()) => {
-            tracing::info!("SMS sent (requested)");
-            Ok((StatusCode::OK, "{\"status\":\"sent\"}".to_string()))
-        },
-        Err(e) => {
-            tracing::error!("Failed to send SMS: {}", e);
-            Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{{\"error\":\"{}\"}}", e)))
-        }
-    }
+        .await
+        .unwrap();
 }
